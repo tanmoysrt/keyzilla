@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 
 	"github.com/miekg/pkcs11"
@@ -205,4 +207,137 @@ func (manager *HardwareKeyManager) Sign(key PublicKey, data []byte) ([]byte, err
 	fmt.Println("ended")
 
 	return signedData, nil
+}
+
+// GenerateKeyPair creates a new RSA key pair in the hardware security module
+func (manager *HardwareKeyManager) GenerateKeyPair(keyID []byte, label string) error {
+	if !manager.loggedIn {
+		return NewError("Not logged in", errors.New("not logged in"))
+	}
+
+	publicKeyTemplate := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
+		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
+		pkcs11.NewAttribute(pkcs11.CKA_VERIFY, true),
+		pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, []byte{1, 0, 1}),
+		pkcs11.NewAttribute(pkcs11.CKA_MODULUS_BITS, 2048),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, label),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, keyID),
+	}
+
+	privateKeyTemplate := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
+		pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true),
+		pkcs11.NewAttribute(pkcs11.CKA_SIGN, true),
+		pkcs11.NewAttribute(pkcs11.CKA_LABEL, label),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, []byte(keyID)),
+		pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true),
+		pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false),
+	}
+
+	mechanism := []*pkcs11.Mechanism{
+		pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS_KEY_PAIR_GEN, nil),
+	}
+
+	pubHandle, _, err := manager.pkcs11Ctx.GenerateKeyPair(
+		*manager.pkcs11Session,
+		mechanism,
+		publicKeyTemplate,
+		privateKeyTemplate,
+	)
+	if err != nil {
+		return NewError("Failed to generate key pair", err)
+	}
+
+	// Fetch the generated public key attributes
+	pubAttrs, err := manager.pkcs11Ctx.GetAttributeValue(*manager.pkcs11Session, pubHandle, []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_MODULUS, nil),
+		pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, nil),
+	})
+	if err != nil {
+		return NewError("Failed to get public key attributes", err)
+	}
+
+	// Create an rsa.PublicKey from the attributes
+	pubKey := &rsa.PublicKey{
+		N: new(big.Int).SetBytes(pubAttrs[0].Value),
+		E: int(new(big.Int).SetBytes(pubAttrs[1].Value).Int64()),
+	}
+
+	// Add the new key to the manager's Keys slice
+	manager.Keys = append(manager.Keys, PublicKey{
+		ID:     []byte(keyID),
+		Object: pubHandle,
+		Label:  label,
+		Key:    pubKey,
+	})
+
+	return nil
+}
+
+// RemoveKeyPair removes both public and private keys with the given keyID from the hardware security module
+func (manager *HardwareKeyManager) RemoveKeyPair(keyID []byte) error {
+	if !manager.loggedIn {
+		return NewError("Not logged in", errors.New("not logged in"))
+	}
+
+	// Find and destroy the public key
+	pubKeyTemplate := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PUBLIC_KEY),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, keyID),
+	}
+
+	if err := manager.pkcs11Ctx.FindObjectsInit(*manager.pkcs11Session, pubKeyTemplate); err != nil {
+		return NewError("FindObjectsInit for public key:", err)
+	}
+	pubKeyObjects, _, err := manager.pkcs11Ctx.FindObjects(*manager.pkcs11Session, 1)
+	if err != nil {
+		return NewError("FindObjects for public key:", err)
+	}
+	if err := manager.pkcs11Ctx.FindObjectsFinal(*manager.pkcs11Session); err != nil {
+		return NewError("FindObjectsFinal for public key:", err)
+	}
+
+	// Find and destroy the private key
+	privKeyTemplate := []*pkcs11.Attribute{
+		pkcs11.NewAttribute(pkcs11.CKA_CLASS, pkcs11.CKO_PRIVATE_KEY),
+		pkcs11.NewAttribute(pkcs11.CKA_ID, keyID),
+	}
+
+	if err := manager.pkcs11Ctx.FindObjectsInit(*manager.pkcs11Session, privKeyTemplate); err != nil {
+		return NewError("FindObjectsInit for private key:", err)
+	}
+	privKeyObjects, _, err := manager.pkcs11Ctx.FindObjects(*manager.pkcs11Session, 1)
+	if err != nil {
+		return NewError("FindObjects for private key:", err)
+	}
+	if err := manager.pkcs11Ctx.FindObjectsFinal(*manager.pkcs11Session); err != nil {
+		return NewError("FindObjectsFinal for private key:", err)
+	}
+
+	// Destroy the public key if found
+	if len(pubKeyObjects) > 0 {
+		err := manager.pkcs11Ctx.DestroyObject(*manager.pkcs11Session, pubKeyObjects[0])
+		if err != nil {
+			return NewError("Failed to destroy public key", err)
+		}
+	}
+
+	// Destroy the private key if found
+	if len(privKeyObjects) > 0 {
+		err := manager.pkcs11Ctx.DestroyObject(*manager.pkcs11Session, privKeyObjects[0])
+		if err != nil {
+			return NewError("Failed to destroy private key", err)
+		}
+	}
+
+	// Remove the key from the manager's Keys slice
+	for i, key := range manager.Keys {
+		if bytes.Equal(key.ID, keyID) {
+			manager.Keys = append(manager.Keys[:i], manager.Keys[i+1:]...)
+			break
+		}
+	}
+
+	return nil
 }
